@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Edital Downloader and Extractor
+Edital Downloader and Extractor with Playwright for Dynamic Pages
 
 This script handles:
 1. Download procurement files from URLs in a JSON file
 2. Extract PDFs from archives
 3. Organize the PDFs in a dedicated directory with sequential naming
+4. Use Playwright for pages requiring button clicks (e.g., Portal de Compras Públicas)
 """
 
 import requests
@@ -18,7 +19,10 @@ import argparse
 import re
 import json
 import logging
+import asyncio
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+import time
 
 # Setup logging
 logging.basicConfig(
@@ -41,11 +45,297 @@ DOWNLOAD_DIR = "downloads_simple"
 EXTRACTED_DIR = "extracted_simple"
 PDF_DIR = "pdfs_simple"
 
+# Playwright globals
+playwright = None
+browser = None
+
 def setup_directories():
     """Create necessary directories if they don't exist."""
     for directory in [DOWNLOAD_DIR, EXTRACTED_DIR, PDF_DIR]:
         os.makedirs(directory, exist_ok=True)
     logging.info(f"Directories setup complete.")
+
+async def setup_playwright():
+    """Initialize Playwright in headless mode."""
+    global playwright, browser
+    if playwright is None:
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)  # Headless mode enabled
+    logging.info("Playwright initialized in headless mode.")
+
+async def teardown_playwright():
+    """Close Playwright browser and stop Playwright."""
+    global playwright, browser
+    if browser:
+        await browser.close()
+    if playwright:
+        await playwright.stop()
+    logging.info("Playwright terminated.")
+
+async def handle_dynamic_download(url):
+    """Use Playwright to download the file by clicking a download button."""
+    playwright = None
+    browser = None
+    context = None
+    
+    try:
+        # Start Playwright and launch browser
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)
+        
+        logging.info(f"Starting dynamic download with Playwright for URL: {url}")
+        
+        # Create browser context with downloads enabled
+        context = await browser.new_context(accept_downloads=True)
+        context.set_default_timeout(30000)  # 30 second timeout for operations
+        
+        # Create a new page and navigate to URL
+        page = await context.new_page()
+        logging.info(f"Navigating to URL: {url}")
+        
+        # Navigate with a longer timeout for slow pages
+        response = await page.goto(url, wait_until="networkidle", timeout=60000)
+        logging.info(f"Page loaded with status: {response.status}")
+        
+        # Take a screenshot for debugging purposes
+        screenshots_dir = os.path.join(DOWNLOAD_DIR, "screenshots")
+        os.makedirs(screenshots_dir, exist_ok=True)
+        screenshot_path = os.path.join(screenshots_dir, f"page_{int(time.time())}.png")
+        await page.screenshot(path=screenshot_path)
+        logging.info(f"Screenshot saved to: {screenshot_path}")
+        
+        # Get page title for logging
+        title = await page.title()
+        logging.info(f"Page title: {title}")
+        
+        # Handle cookie consent dialog before proceeding
+        logging.info("Checking for cookie consent dialogs...")
+        try:
+            # Try different common cookie consent selectors
+            cookie_selectors = [
+                "button#onetrust-accept-btn-handler",
+                "button[aria-label='Accept cookies']",
+                "button[aria-label='Aceitar cookies']",
+                "button:has-text('Accept')",
+                "button:has-text('Aceitar')",
+                "button:has-text('Accept All Cookies')",
+                "button:has-text('Aceitar Todos os Cookies')",
+                "[id*='cookie'] button:has-text('Accept')",
+                "[id*='cookie'] button:has-text('Aceitar')",
+                ".cookie-banner button:first-child",
+                "#cookieConsent button.accept",
+                "#gdpr-consent-tool-wrapper button[data-text-accept]",
+                "#consent-page button.consent-accept"
+            ]
+            
+            for selector in cookie_selectors:
+                try:
+                    cookie_button = await page.wait_for_selector(selector, state="visible", timeout=3000)
+                    if cookie_button:
+                        logging.info(f"Found cookie consent button with selector: {selector}")
+                        await cookie_button.click()
+                        logging.info("Clicked cookie consent button")
+                        await page.wait_for_timeout(1500)  # Wait for overlay to disappear
+                        break
+                except:
+                    continue
+                    
+            # Alternative approach: try to locate using a common cookie banner ID
+            if await page.query_selector("#onetrust-banner-sdk"):
+                logging.info("Found OneTrust cookie banner")
+                try:
+                    # Try clicking the accept button via JavaScript
+                    await page.evaluate("""() => { 
+                        document.querySelector("#onetrust-accept-btn-handler").click(); 
+                    }""")
+                    logging.info("Accepted cookies via JavaScript")
+                    await page.wait_for_timeout(1500)
+                except Exception as e:
+                    logging.warning(f"Failed to accept OneTrust cookies via JavaScript: {e}")
+                    
+        except Exception as e:
+            logging.warning(f"Error handling cookie consent: {e}")
+        
+        # Try different approaches to find the download button
+        logging.info("Searching for download button...")
+        download_button = None
+        
+        # List of possible selectors for download buttons
+        selectors = [
+            "button:has-text('Baixar Arquivo')",
+            "button:has-text('Baixar')",
+            "a:has-text('Baixar Arquivo')",
+            "a:has-text('Baixar')",
+            "div.botaoBaixar",
+            "a.botaoBaixar",
+            "[data-test='download-button']",
+            "[aria-label='Baixar arquivo']",
+            "button:has-text('Download')",
+            "a:has-text('Download')"
+        ]
+        
+        # Try each selector
+        for selector in selectors:
+            try:
+                logging.info(f"Trying selector: {selector}")
+                # Use a shorter timeout for each individual selector
+                download_button = await page.wait_for_selector(selector, state="visible", timeout=3000)
+                if download_button:
+                    logging.info(f"Found download button with selector: {selector}")
+                    break
+            except:
+                logging.info(f"Selector not found: {selector}")
+                continue
+        
+        # If no button found with selectors, try to find by text content
+        if not download_button:
+            logging.info("No button found with standard selectors, trying to find by text content")
+            
+            # Get all buttons and links
+            all_buttons = await page.query_selector_all("button")
+            all_links = await page.query_selector_all("a")
+            elements = all_buttons + all_links
+            
+            logging.info(f"Found {len(elements)} potential clickable elements")
+            
+            # Check each element for download-related text
+            for i, element in enumerate(elements):
+                try:
+                    text_content = await element.text_content()
+                    if text_content and ('baixar' in text_content.lower() or 
+                                        'download' in text_content.lower() or 
+                                        'arquivo' in text_content.lower()):
+                        download_button = element
+                        logging.info(f"Found element {i+1} with text: '{text_content}'")
+                        break
+                except Exception as e:
+                    logging.debug(f"Error getting text content from element {i+1}: {e}")
+                    continue
+        
+        # If download button found, click it and download the file
+        if download_button:
+            logging.info("Found download button, clicking...")
+            
+            # Setup download event listener before clicking
+            download_promise = page.wait_for_event("download", timeout=30000)
+            
+            try:
+                # First try normal click
+                await download_button.click()
+                logging.info("Clicked download button")
+            except Exception as e:
+                logging.warning(f"Normal click failed: {e}")
+                logging.info("Trying JavaScript click as fallback...")
+                
+                try:
+                    # Try JavaScript click as fallback for overlay issues
+                    element_selector = await download_button.evaluate("el => { return el.tagName.toLowerCase() + (el.id ? '#'+el.id : '') + (el.className ? '.'+el.className.split(' ').join('.') : ''); }")
+                    logging.info(f"Using JavaScript to click element: {element_selector}")
+                    
+                    # Try to force click via JavaScript
+                    await page.evaluate(f"""() => {{ 
+                        const element = document.querySelector("{element_selector}");
+                        if (element) {{
+                            element.click();
+                        }}
+                    }}""")
+                    logging.info("JavaScript click executed")
+                except Exception as js_error:
+                    logging.error(f"JavaScript click also failed: {js_error}")
+            
+            # Wait for download to start
+            try:
+                download = await download_promise
+                
+                # Get the filename safely
+                try:
+                    filename = await download.suggested_filename()
+                except Exception as e:
+                    # Handle case where suggested_filename might be a string rather than a function
+                    if hasattr(download, 'suggested_filename') and isinstance(download.suggested_filename, str):
+                        filename = download.suggested_filename
+                    else:
+                        logging.warning(f"Could not get suggested filename: {e}")
+                        filename = f"download_{int(time.time())}.pdf"
+                
+                logging.info(f"Download started: {filename}")
+                
+                # Save the file
+                downloaded_path = os.path.join(DOWNLOAD_DIR, filename)
+                await download.save_as(downloaded_path)
+                logging.info(f"Downloaded file: {downloaded_path}")
+                
+                # Check if file exists and has content
+                if os.path.exists(downloaded_path) and os.path.getsize(downloaded_path) > 0:
+                    logging.info(f"Download successful! File size: {os.path.getsize(downloaded_path)} bytes")
+                    return f"file://{os.path.abspath(downloaded_path)}"
+                else:
+                    logging.error("Download failed: File is empty or doesn't exist")
+                    return None
+            except TimeoutError:
+                logging.error("Timeout waiting for download to start after clicking button")
+                return None
+        else:
+            # No download button found, log details for debugging
+            logging.error("Could not find any download button")
+            
+            # Log buttons on the page for debugging
+            all_buttons = await page.query_selector_all("button")
+            logging.info(f"Found {len(all_buttons)} buttons on the page")
+            for i, button in enumerate(all_buttons[:5]):  # Log the first 5 buttons
+                try:
+                    text = await button.text_content()
+                    logging.info(f"Button {i+1}: '{text}'")
+                except:
+                    pass
+            
+            # Log links on the page for debugging
+            all_links = await page.query_selector_all("a")
+            logging.info(f"Found {len(all_links)} links on the page")
+            for i, link in enumerate(all_links[:5]):  # Log the first 5 links
+                try:
+                    href = await link.get_attribute("href")
+                    text = await link.text_content()
+                    logging.info(f"Link {i+1}: '{text}' -> {href}")
+                except:
+                    pass
+            
+            # Save page HTML for debugging
+            html_content = await page.content()
+            debug_html_path = os.path.join(DOWNLOAD_DIR, f"debug_page_{int(time.time())}.html")
+            with open(debug_html_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            logging.info(f"Saved page HTML to: {debug_html_path}")
+            
+            # Try one last fallback method - look for PDF links directly in the page
+            pdf_links = await page.query_selector_all("a[href$='.pdf']")
+            if pdf_links:
+                logging.info(f"Found {len(pdf_links)} direct PDF links on the page")
+                for i, link in enumerate(pdf_links):
+                    try:
+                        href = await link.get_attribute("href")
+                        logging.info(f"PDF link {i+1}: {href}")
+                        if i == 0:  # Try the first PDF link
+                            logging.info(f"Attempting to download from direct PDF link: {href}")
+                            return href
+                    except:
+                        pass
+            
+            return None
+    
+    except Exception as e:
+        logging.error(f"Error with Playwright: {e}")
+        logging.error(traceback.format_exc())
+        return None
+    finally:
+        # Clean up resources
+        if context:
+            await context.close()
+        if browser:
+            await browser.close()
+        if playwright:
+            await playwright.stop()
+        logging.info("Playwright resources cleaned up")
 
 def handle_portal_compras_publicas(url):
     """
@@ -61,6 +351,20 @@ def handle_portal_compras_publicas(url):
     }
     
     try:
+        # First check if this page requires dynamic interaction
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Check for download buttons
+            download_buttons = soup.find_all('button', string=re.compile(r'Baixar\s*Arquivo', re.IGNORECASE))
+            if download_buttons or 'Baixar Arquivo' in response.text:
+                logging.info("Detected dynamic page requiring Playwright for button click.")
+                return asyncio.run(handle_dynamic_download(url))
+        except Exception as e:
+            logging.warning(f"Error checking for dynamic content: {e}")
+            
+        # Continue with existing static URL handling code
         # Check if this is the specific SAMAE São Bento do Sul procurement
         if 'servico-autonomo-municipal-de-agua-e-esgoto-de-sao-bento-do-sul-samae' in url and 'pe-81-2024' in url:
             logging.info("Detected SAMAE São Bento do Sul procurement PE 81/2024")
@@ -220,12 +524,22 @@ def download_file(url, headers=None):
         
         # If we got HTML and it's from portaldecompraspublicas.com.br, we need to extract the PDF URL
         if 'text/html' in response.headers.get('Content-Type', '').lower() and 'portaldecompraspublicas.com.br' in url:
-            logging.info("Detected Portal de Compras Públicas page, processing with BeautifulSoup...")
+            logging.info("Detected Portal de Compras Públicas page, processing...")
             pdf_url = handle_portal_compras_publicas(url)
             if pdf_url:
-                return download_file(pdf_url, headers)
+                if pdf_url.startswith('file://'):
+                    # This is a locally downloaded file from Playwright
+                    return download_file(pdf_url, headers)
+                else:
+                    # This is a URL to download
+                    return download_file(pdf_url, headers)
             else:
                 logging.error("Failed to extract PDF URL from Portal de Compras Públicas page")
+                # Try Playwright as a last resort
+                logging.info("Attempting Playwright as a last resort")
+                pdf_url = asyncio.run(handle_dynamic_download(url))
+                if pdf_url:
+                    return download_file(pdf_url, headers)
                 return False, None, False
         
         # Try to get the filename from the Content-Disposition header
@@ -462,6 +776,7 @@ def main():
     parser.add_argument("--json", help="Path to JSON file containing URLs", required=True)
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     
+    global args
     args = parser.parse_args()
     
     # Setup directories
@@ -490,11 +805,52 @@ def main():
                     logging.error(f"Failed to process alertalicitacao URL {index}.")
                     continue
             
-            # Download the file
-            success, file_path, is_pdf = download_file(url)
+            # Check if this URL might need dynamic handling
+            needs_playwright = False
+            
+            # Portal de Compras URLs often need Playwright
+            if 'portaldecompraspublicas.com.br' in url:
+                try:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    }
+                    response = requests.get(url, headers=headers, timeout=5)
+                    if 'Baixar Arquivo' in response.text or 'Download' in response.text:
+                        logging.info("Detected potential dynamic Portal de Compras page")
+                        needs_playwright = True
+                except Exception as e:
+                    logging.warning(f"Error pre-checking URL {url}: {e}")
+                    # If we can't check, assume dynamic
+                    needs_playwright = True
+            
+            # Try download approaches in sequence
+            success = False
+            file_path = None
+            is_pdf = False
+            
+            if needs_playwright:
+                # Try Playwright first for known dynamic pages
+                logging.info("Using Playwright for dynamic page handling")
+                pdf_url = asyncio.run(handle_dynamic_download(url))
+                if pdf_url:
+                    # If Playwright returned a URL, try downloading it
+                    success, file_path, is_pdf = download_file(pdf_url)
+                    if success:
+                        logging.info("Successfully downloaded file using Playwright")
+            
+            # If Playwright failed or wasn't needed, try regular download
+            if not success:
+                success, file_path, is_pdf = download_file(url)
+            
+            # Last resort - try with Playwright even if we didn't think it was needed
+            if not success and not needs_playwright:
+                logging.info("Regular download failed, trying with Playwright as fallback")
+                pdf_url = asyncio.run(handle_dynamic_download(url))
+                if pdf_url:
+                    success, file_path, is_pdf = download_file(pdf_url)
             
             if not success:
-                logging.error(f"Download failed for URL {index}.")
+                logging.error(f"Download failed for URL {index} after trying all methods.")
                 continue
             
             # Process the downloaded file

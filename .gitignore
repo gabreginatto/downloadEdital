@@ -1,4 +1,13 @@
-# Byte-compiled / optimized / DLL files
+# Downloaded files and extracted directories
+downloads_simple/
+extracted_simple/
+pdfs_simple/
+downloads_test/
+downloads_test_link4/
+extracted_test_link4/
+pdfs_test_link4/
+
+# Python cache files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -62,10 +71,8 @@ venv.bak/
 *.swo
 
 # Project specific
-downloads_simple/
-extracted_simple/
-pdfs_simple/
 summaries/
 *.log
 *.pdf
-.DS_Store 
+.DS_Store
+Thumbs.db 
