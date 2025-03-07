@@ -26,6 +26,7 @@ import json
 import random
 import traceback
 from PIL import Image, ImageDraw  # For visual debugging
+import glob
 
 # Load environment variables (for API keys)
 load_dotenv()
@@ -189,16 +190,20 @@ async def handle_captcha_with_retries(main_page, popup_page, max_retries=4):
         logging.info(f"CAPTCHA attempt {captcha_attempts} of {max_retries}")
 
         # Take a screenshot of the popup for debugging
-        attempt_screenshot = os.path.join(DOWNLOAD_DIR, f"captcha_attempt_popup_{captcha_attempts}.png")
-        await popup_page.screenshot(path=attempt_screenshot)
-        logging.info(f"Popup screenshot: {attempt_screenshot}")
+        try:
+            attempt_screenshot = os.path.join(DOWNLOAD_DIR, f"captcha_attempt_popup_{captcha_attempts}.png")
+            await popup_page.screenshot(path=attempt_screenshot)
+            logging.info(f"Popup screenshot: {attempt_screenshot}")
 
-        # Save the HTML content of the popup for debugging
-        popup_html = await popup_page.content()
-        popup_html_path = os.path.join(DEBUG_DIR, f"popup_html_{captcha_attempts}.html")
-        with open(popup_html_path, "w", encoding="utf-8") as f:
-            f.write(popup_html)
-        logging.info(f"Saved popup HTML to: {popup_html_path}")
+            # Save the HTML content of the popup for debugging
+            popup_html = await popup_page.content()
+            popup_html_path = os.path.join(DEBUG_DIR, f"popup_html_{captcha_attempts}.html")
+            with open(popup_html_path, "w", encoding="utf-8") as f:
+                f.write(popup_html)
+            logging.info(f"Saved popup HTML to: {popup_html_path}")
+        except Exception as e:
+            logging.error(f"Error capturing popup state: {e}")
+            return False, None
 
         # Find all images in the popup and log their details
         all_images = await popup_page.query_selector_all("img")
@@ -219,13 +224,12 @@ async def handle_captcha_with_retries(main_page, popup_page, max_retries=4):
             except Exception as e:
                 logging.warning(f"Error inspecting image {i+1}: {e}")
 
-        # More specifically targeted CAPTCHA selectors based on ComprasNet's structure
+        # Find CAPTCHA image (re-run this each attempt)
         captcha_selectors = [
             # Try to find a large image near the "Digite os caracteres ao lado:" text
             "img:near(:text('Digite os caracteres ao lado:'))",
             
             # Try using a direct evaluation to find an image with specific dimensions
-            # This custom evaluation targets images that are of typical CAPTCHA size (larger than icons)
             "img:eval(node => node.width > 50 && node.height > 20)",
             
             # Most specific - looking for CAPTCHA with distinctive visual clues
@@ -463,6 +467,24 @@ async def handle_captcha_with_retries(main_page, popup_page, max_retries=4):
                 logging.info("Clicking CAPTCHA refresh button")
                 await refresh_button.click()
                 await popup_page.wait_for_timeout(2000)
+                
+                # Wait for the page to stabilize after refresh
+                try:
+                    # Wait for CAPTCHA image to appear again
+                    await popup_page.wait_for_selector("img[src*='captcha']", timeout=5000)
+                    # Wait a bit more to ensure everything is loaded
+                    await popup_page.wait_for_timeout(1000)
+                    logging.info("Detected new CAPTCHA image after refresh")
+                    
+                    # Force reload the popup in case the page structure changed
+                    await popup_page.reload()
+                    await popup_page.wait_for_load_state("networkidle")
+                    await popup_page.wait_for_timeout(1000)
+                    logging.info("Reloaded popup page after CAPTCHA refresh")
+                except Exception as e:
+                    logging.warning(f"Could not detect new CAPTCHA image: {e}")
+                
+                logging.info("New CAPTCHA should be loaded now")
                 continue
             
             # If we can't refresh, try a standard value as last resort
@@ -553,19 +575,110 @@ async def handle_captcha_with_retries(main_page, popup_page, max_retries=4):
         except Exception as e:
             logging.warning(f"No download event detected after CAPTCHA submission: {e}")
 
+        # Check if popup is still available - if not, it might have closed after successful submission
+        try:
+            is_popup_closed = not await popup_page.evaluate('() => !document.body || window.closed')
+            if is_popup_closed:
+                logging.info("Popup closed after submission, checking for download...")
+                # Wait a bit more for download that might be in progress
+                await main_page.wait_for_timeout(5000)
+                
+                # Double-check if any downloads happened
+                recent_files = glob.glob(os.path.join(DOWNLOAD_DIR, "*"))
+                # Sort by modification time, newest first
+                recent_files.sort(key=os.path.getmtime, reverse=True)
+                
+                if recent_files and (time.time() - os.path.getmtime(recent_files[0])) < 10:
+                    # A file was downloaded in the last 10 seconds
+                    downloaded_path = recent_files[0]
+                    logging.info(f"Found recent download: {downloaded_path}")
+                    
+                    if os.path.exists(downloaded_path) and os.path.getsize(downloaded_path) > 0:
+                        pdf_path = os.path.join(PDF_DIR, os.path.basename(downloaded_path))
+                        shutil.copy2(downloaded_path, pdf_path)
+                        logging.info(f"Copied to PDF directory: {pdf_path}")
+                        captcha_solved = True
+                        return True, downloaded_path
+                
+                logging.warning("Popup closed but no download was detected")
+                continue
+        except Exception as e:
+            logging.warning(f"Error checking if popup is closed: {e}")
+
         # Check for CAPTCHA rejection
         try:
-            popup_exists = await popup_page.evaluate('() => document.body !== null')
+            popup_exists = False
+            try:
+                popup_exists = await popup_page.evaluate('() => document.body !== null')
+            except Exception as e:
+                logging.warning(f"Popup page seems to be closed: {e}")
+                continue  # Go to next attempt if popup is closed
             
             if popup_exists:
-                popup_content = await popup_page.content()
+                # First check specifically for "Controle informado inválido. Forneça novamente" message
+                popup_content = ""
+                try:
+                    popup_content = await popup_page.content()
+                except Exception as e:
+                    logging.warning(f"Could not get popup content, popup may be closed: {e}")
+                    continue  # Go to next attempt if we can't get content
+                
+                if "Controle informado inválido" in popup_content or "Forneça novamente" in popup_content:
+                    logging.warning("CAPTCHA rejected: 'Controle informado inválido. Forneça novamente' message found")
+                    
+                    # Try to find and click the "Gerar outra imagem" button
+                    try:
+                        logging.info("Looking for 'Gerar outra imagem' button...")
+                        # Try multiple selector approaches to find the button or link
+                        refresh_selectors = [
+                            "a:has-text('Gerar outra imagem')",
+                            "a:has-text('gerar outra imagem')",
+                            "a[href*='captcha']",
+                            "a:near(:text('Digite os caracteres ao lado:'))",
+                            "a", # Last resort, try all links and look for one that might be the refresh
+                        ]
+                        
+                        for selector in refresh_selectors:
+                            refresh_button = await popup_page.query_selector(selector)
+                            if refresh_button:
+                                logging.info(f"Found 'Gerar outra imagem' button with selector: {selector}")
+                                await refresh_button.click()
+                                await popup_page.wait_for_timeout(2000)  # Wait for new CAPTCHA to load
+                                
+                                # Wait for the page to stabilize after refresh
+                                try:
+                                    # Wait for CAPTCHA image to appear again
+                                    await popup_page.wait_for_selector("img[src*='captcha']", timeout=5000)
+                                    # Wait a bit more to ensure everything is loaded
+                                    await popup_page.wait_for_timeout(1000)
+                                    logging.info("Detected new CAPTCHA image after refresh")
+                                    
+                                    # Force reload the popup in case the page structure changed
+                                    await popup_page.reload()
+                                    await popup_page.wait_for_load_state("networkidle")
+                                    await popup_page.wait_for_timeout(1000)
+                                    logging.info("Reloaded popup page after CAPTCHA refresh")
+                                except Exception as e:
+                                    logging.warning(f"Could not detect new CAPTCHA image: {e}")
+                                
+                                logging.info("New CAPTCHA should be loaded now")
+                                break
+                        else:
+                            logging.warning("Could not find 'Gerar outra imagem' button")
+                    except Exception as e:
+                        logging.error(f"Error clicking 'Gerar outra imagem' button: {e}")
+                    
+                    continue  # Skip to next attempt since we found CAPTCHA rejection
+                
+                # Check for other CAPTCHA error indicators
                 captcha_error_indicators = [
                     "captcha inválido",
                     "captcha incorreto",
                     "caracteres informados não conferem",
                     "captcha errado",
                     "captcha não confere",
-                    "invalid captcha"
+                    "invalid captcha",
+                    "controle informado inválido"
                 ]
 
                 captcha_rejected = False
@@ -573,6 +686,49 @@ async def handle_captcha_with_retries(main_page, popup_page, max_retries=4):
                     if indicator.lower() in popup_content.lower():
                         logging.warning(f"CAPTCHA rejected: '{indicator}' found in popup content")
                         captcha_rejected = True
+                        
+                        # Try to find and click the "Gerar outra imagem" button
+                        try:
+                            logging.info("Looking for 'Gerar outra imagem' button...")
+                            # Try multiple selector approaches to find the button or link
+                            refresh_selectors = [
+                                "a:has-text('Gerar outra imagem')",
+                                "a:has-text('gerar outra imagem')",
+                                "a[href*='captcha']",
+                                "a:near(:text('Digite os caracteres ao lado:'))",
+                                "a", # Last resort, try all links and look for one that might be the refresh
+                            ]
+                            
+                            for selector in refresh_selectors:
+                                refresh_button = await popup_page.query_selector(selector)
+                                if refresh_button:
+                                    logging.info(f"Found 'Gerar outra imagem' button with selector: {selector}")
+                                    await refresh_button.click()
+                                    await popup_page.wait_for_timeout(2000)  # Wait for new CAPTCHA to load
+                                    
+                                    # Wait for the page to stabilize after refresh
+                                    try:
+                                        # Wait for CAPTCHA image to appear again
+                                        await popup_page.wait_for_selector("img[src*='captcha']", timeout=5000)
+                                        # Wait a bit more to ensure everything is loaded
+                                        await popup_page.wait_for_timeout(1000)
+                                        logging.info("Detected new CAPTCHA image after refresh")
+                                        
+                                        # Force reload the popup in case the page structure changed
+                                        await popup_page.reload()
+                                        await popup_page.wait_for_load_state("networkidle")
+                                        await popup_page.wait_for_timeout(1000)
+                                        logging.info("Reloaded popup page after CAPTCHA refresh")
+                                    except Exception as e:
+                                        logging.warning(f"Could not detect new CAPTCHA image: {e}")
+                                    
+                                    logging.info("New CAPTCHA should be loaded now")
+                                    break
+                            else:
+                                logging.warning("Could not find 'Gerar outra imagem' button")
+                        except Exception as e:
+                            logging.error(f"Error clicking 'Gerar outra imagem' button: {e}")
+                        
                         break
 
                 if captcha_rejected:
