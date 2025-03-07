@@ -1,0 +1,28 @@
+{
+  "automaticUpdatePolicy": {},
+  "availableMemoryMb": 256,
+  "buildId": "cf44fc8a-baea-4ae8-bd12-4a41b75e7882",
+  "buildName": "projects/667261805987/locations/us-central1/builds/cf44fc8a-baea-4ae8-bd12-4a41b75e7882",
+  "buildServiceAccount": "projects/licitacoesauto/serviceAccounts/667261805987-compute@developer.gserviceaccount.com",
+  "dockerRegistry": "CONTAINER_REGISTRY",
+  "entryPoint": "compareJson",
+  "eventTrigger": {
+    "eventType": "google.pubsub.topic.publish",
+    "failurePolicy": {},
+    "resource": "projects/licitacoesauto/topics/compare-tenders-topic",
+    "service": "pubsub.googleapis.com"
+  },
+  "ingressSettings": "ALLOW_ALL",
+  "labels": {
+    "deployment-tool": "console-cloud"
+  },
+  "maxInstances": 3000,
+  "name": "projects/licitacoesauto/locations/us-central1/functions/compareJson",
+  "runtime": "nodejs20",
+  "serviceAccountEmail": "licitacoesauto@appspot.gserviceaccount.com",
+  "sourceUploadUrl": "https://storage.googleapis.com/uploads-548595273659.us-central1.cloudfunctions.appspot.com/2c88d8d2-517d-4ab2-bd8e-e6df9603a646.zip",
+  "status": "ACTIVE",
+  "timeout": "60s",
+  "updateTime": "2024-11-01T19:03:25.923Z",
+  "versionId": "3"
+}
